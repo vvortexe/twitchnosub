@@ -4,10 +4,6 @@ twitch-nosub.js text/javascript
     if ( /(^|\.)twitch\.tv$/.test(document.location.hostname) === false ) { return; }
     if ( window.__twitchNoSub ) { return; }
     window.__twitchNoSub = true;
-    /* Port of TwitchNoSub (https://github.com/besuper/TwitchNoSub) for uBlock Origin.
-       Formatting rules for uBO resource files: no blank lines, and no line may start
-       at column 0 with "#" or "// " -- uBO would end/strip the resource there. */
-    /* Runs inside Twitch's video worker (stringified and prepended to the worker source). */
     const workerPatch = function() {
         const CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
         const RESOLUTIONS = [
@@ -47,11 +43,9 @@ twitch-nosub.js text/javascript
             if ( !response.ok ) { return null; }
             const data = await response.text();
             if ( data.includes('.ts') ) {
-                /* .ts segments still use h264 */
                 return { codec: 'avc1.4D001E' };
             }
             if ( data.includes('.mp4') ) {
-                /* .mp4 segments are usually h265, sometimes h264 */
                 const mp4Request = await oldFetch(url.replace('index-dvr.m3u8', 'init-0.mp4'), { cache: 'force-cache' });
                 if ( mp4Request.ok ) {
                     const content = await mp4Request.text();
@@ -84,17 +78,22 @@ twitch-nosub.js text/javascript
             const daysOld = (new Date('2023-02-10').getTime() - new Date(vodData.createdAt).getTime()) / (1000 * 3600 * 24);
             console.log('[TNS] Channel: ' + (channelData && channelData.login) + ', broadcastType: ' + broadcastType + ', domain: ' + domain + ', vodSpecialID: ' + vodSpecialID);
             let playlist = '#EXTM3U\n#EXT-X-TWITCH-INFO:ORIGIN="s3",B="false",REGION="EU",USER-IP="127.0.0.1",SERVING-ID="' + createServingID() + '",CLUSTER="cloudfront_vod",USER-COUNTRY="BE",MANIFEST-CLUSTER="cloudfront_vod"';
-            let bandwidth = 8534030;
-            for ( const [ resKey, res ] of RESOLUTIONS ) {
-                let playlistUrl;
+            const playlistUrlFor = resKey => {
                 if ( broadcastType === 'highlight' ) {
-                    playlistUrl = 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/highlight-' + vodId + '.m3u8';
-                } else if ( broadcastType === 'upload' && daysOld > 7 ) {
-                    playlistUrl = 'https://' + domain + '/' + channelData.login + '/' + vodId + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
-                } else {
-                    playlistUrl = 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
+                    return 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/highlight-' + vodId + '.m3u8';
                 }
-                const result = await isValidQuality(playlistUrl);
+                if ( broadcastType === 'upload' && daysOld > 7 ) {
+                    return 'https://' + domain + '/' + channelData.login + '/' + vodId + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
+                }
+                return 'https://' + domain + '/' + vodSpecialID + '/' + resKey + '/index-dvr.m3u8';
+            };
+            const probes = await Promise.all(RESOLUTIONS.map(async ([ resKey, res ]) => {
+                const playlistUrl = playlistUrlFor(resKey);
+                const result = await isValidQuality(playlistUrl).catch(() => null);
+                return { resKey, res, playlistUrl, result };
+            }));
+            let bandwidth = 8534030;
+            for ( const { resKey, res, playlistUrl, result } of probes ) {
                 if ( !result ) { continue; }
                 console.log('[TNS] Found quality ' + resKey);
                 if ( isUsherV2 ) {
@@ -120,10 +119,16 @@ twitch-nosub.js text/javascript
         self.fetch = async function(input, opt) {
             const url = input instanceof Request ? input.url : String(input);
             const response = await oldFetch(input, opt);
-            /* Switch playlist from unmuted to muted segments */
-            if ( url.includes('cloudfront') && url.includes('.m3u8') ) {
+            if ( response.ok && url.includes('cloudfront') && url.includes('.m3u8') ) {
                 const body = await response.text();
-                return new Response(body.replace(/-unmuted/g, '-muted'), { status: 200 });
+                const headers = new Headers(response.headers);
+                headers.delete('content-length');
+                headers.delete('content-encoding');
+                return new Response(body.replace(/-unmuted/g, '-muted'), {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers
+                });
             }
             if ( url.startsWith('https://usher.ttvnw.net/vod/') && response.status !== 200 ) {
                 console.log('[TNS] Usher request intercepted (status ' + response.status + '): ' + url);
@@ -149,6 +154,10 @@ twitch-nosub.js text/javascript
     window.Worker = class Worker extends OldWorker {
         constructor(url, options) {
             let workerUrl = url;
+            if ( String(url).startsWith('blob:') === false ) {
+                super(url, options);
+                return;
+            }
             try {
                 const src = getWorkerJs(String(url).replaceAll("'", '%27'));
                 workerUrl = URL.createObjectURL(new Blob([ patchSource + src ], { type: 'text/javascript' }));
